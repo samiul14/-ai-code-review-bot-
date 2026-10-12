@@ -4,7 +4,8 @@ name: AI Code Review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [main]
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -12,7 +13,9 @@ permissions:
 
 jobs:
   review:
+    name: Gemini AI Review
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -23,35 +26,39 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download actual pull request diff
+      - name: Download Pull Request diff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          set -euo pipefail
+
           curl --fail --silent --show-error --location \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github.diff" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/$REPOSITORY/pulls/$PR_NUMBER" \
             -o "$RUNNER_TEMP/pr.diff"
 
           if [ ! -s "$RUNNER_TEMP/pr.diff" ]; then
-            echo "Pull request diff is empty."
+            echo "ERROR: Pull Request diff is empty."
             exit 1
           fi
 
           head -c 50000 "$RUNNER_TEMP/pr.diff" > pr.diff
-          echo "Downloaded diff size:"
+
+          echo "Diff downloaded successfully."
           wc -c pr.diff
 
-      - name: Run AI code review
+      - name: Run Gemini AI review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: gemini-2.5-flash
+          GEMINI_MODEL: gemini-3.8-flash
           DIFF_FILE: pr.diff
         run: python review.py
 
-      - name: Publish review on Pull Request
+      - name: Post review comment on Pull Request
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -63,22 +70,30 @@ jobs:
           import urllib.request
           from pathlib import Path
 
-          report = Path("review.md").read_text(encoding="utf-8")
-          body = "## AI Code Review\n\n" + report
+          report = Path("review.md").read_text(
+              encoding="utf-8"
+          ).strip()
+
+          body = "## 🤖 Gemini AI Code Review\n\n" + report
           body = body[:60000]
 
           url = (
-              f"https://api.github.com/repos/"
+              "https://api.github.com/repos/"
               f"{os.environ['REPOSITORY']}/issues/"
               f"{os.environ['PR_NUMBER']}/comments"
           )
 
-          payload = json.dumps({"body": body}).encode("utf-8")
+          payload = json.dumps({
+              "body": body
+          }).encode("utf-8")
+
           request = urllib.request.Request(
               url,
               data=payload,
               headers={
-                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Authorization": (
+                      f"Bearer {os.environ['GH_TOKEN']}"
+                  ),
                   "Accept": "application/vnd.github+json",
                   "Content-Type": "application/json",
                   "X-GitHub-Api-Version": "2022-11-28"
@@ -86,6 +101,11 @@ jobs:
               method="POST"
           )
 
-          with urllib.request.urlopen(request, timeout=30) as response:
-              print("Review comment posted. HTTP", response.status)
+          with urllib.request.urlopen(
+              request, timeout=30
+          ) as response:
+              print(
+                  "AI review comment posted. HTTP",
+                  response.status
+              )
           PY
