@@ -1,30 +1,35 @@
-
 import json
 import os
 import sys
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
+FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash").split(",")
+    if m.strip()
+]
 DIFF_FILE = os.environ.get("DIFF_FILE", "pr.diff")
 REPORT_FILE = "review.md"
 
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+FATAL_STATUS = {400, 401, 403}
+MAX_ATTEMPTS_PER_MODEL = 4
+BACKOFF_SECONDS = [10, 20, 40]
 
-def call_gemini(diff):
-    if not API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing. "
-            "Add it in GitHub Repository Secrets."
-        )
 
-    if not diff.strip():
-        raise RuntimeError(
-            "The pull request diff is empty. No code to review."
-        )
+class GeminiHttpError(RuntimeError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
 
-    prompt = f"""
+
+def _build_prompt(diff):
+    return f"""
 You are an experienced senior software engineer and security reviewer.
 
 Review the following GitHub Pull Request diff.
@@ -58,9 +63,11 @@ Code diff:
 {diff[:50000]}
 """
 
+
+def _generate_once(model, prompt):
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{MODEL}:generateContent"
+        f"{model}:generateContent"
     )
 
     payload = {
@@ -97,9 +104,10 @@ Code diff:
         details = exc.read().decode(
             "utf-8", errors="replace"
         )
-        raise RuntimeError(
+        raise GeminiHttpError(
+            exc.code,
             f"Gemini API HTTP error: {exc.code}\n"
-            f"{details[:3000]}"
+            f"{details[:3000]}",
         ) from exc
 
     except urllib.error.URLError as exc:
@@ -134,6 +142,59 @@ Code diff:
         )
 
     return report
+
+
+def call_gemini(diff):
+    if not API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. "
+            "Add it in GitHub Repository Secrets."
+        )
+
+    if not diff.strip():
+        raise RuntimeError(
+            "The pull request diff is empty. No code to review."
+        )
+
+    prompt = _build_prompt(diff)
+    models = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
+    last_error = None
+
+    for model in models:
+        for attempt in range(1, MAX_ATTEMPTS_PER_MODEL + 1):
+            try:
+                print(f"[gemini] model={model} attempt={attempt}", flush=True)
+                return _generate_once(model, prompt)
+            except GeminiHttpError as exc:
+                last_error = exc
+                if exc.status in FATAL_STATUS:
+                    raise
+                if exc.status in RETRYABLE_STATUS and attempt < MAX_ATTEMPTS_PER_MODEL:
+                    wait = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
+                    print(
+                        f"[gemini] HTTP {exc.status} from {model}; "
+                        f"retrying in {wait}s...",
+                        flush=True,
+                    )
+                    time.sleep(wait)
+                    continue
+                print(
+                    f"[gemini] {model} gave HTTP {exc.status}; "
+                    "trying next model...",
+                    flush=True,
+                )
+                break
+            except RuntimeError as exc:
+                last_error = exc
+                print(
+                    f"[gemini] {model} error: {exc}; trying next model...",
+                    flush=True,
+                )
+                break
+
+    raise last_error if last_error is not None else RuntimeError(
+        "Gemini review failed for unknown reasons."
+    )
 
 
 def main():
